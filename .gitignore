@@ -1,0 +1,7 @@
+.vscode
+.venv
+*.mp4
+new_data/
+data/
+__pycache__/
+.env
