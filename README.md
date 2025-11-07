@@ -51,4 +51,4 @@ https://github.com/user-attachments/assets/69ecddbf-3db9-43bb-9c0e-81497fb50600
 ### The system is designed for use in surveillance and monitoring scenarios where quick detection and response to accidents are crucial. It can be deployed in traffic management systems, surveillance cameras, and other relevant environments.
 
 # Contact
-### For Dataset and inquiries, contact [Soham Soni](mailto:sonisoham91@gmail.com) .
+### For Dataset and inquiries, contact [Rohan Malhotra](mailto:rohanmalhotra430@gmail.com) .
