@@ -8,6 +8,9 @@ import time
 import tkinter as tk
 from twilio.rest import Client
 from PIL import Image, ImageTk  # Import PIL modules for image handling
+from dotenv import load_dotenv
+
+load_dotenv()
 
 emergency_timer = None
 alarm_triggered = False  # Flag to track if an alarm has been triggered
