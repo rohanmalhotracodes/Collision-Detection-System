@@ -5,3 +5,6 @@ new_data/
 data/
 __pycache__/
 .env
+*.keras
+*.json
+accident_photos/

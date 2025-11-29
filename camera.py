@@ -1,126 +1,188 @@
-import cv2
-from detection import AccidentDetectionModel
-import numpy as np
+import math
 import os
-import winsound
 import threading
 import time
-import tkinter as tk
-from twilio.rest import Client
-from PIL import Image, ImageTk  # Import PIL modules for image handling
+
+import cv2
+import numpy as np
 from dotenv import load_dotenv
+from twilio.rest import Client
+
+from detection import AccidentDetectionModel
 
 load_dotenv()
 
-emergency_timer = None
-alarm_triggered = False  # Flag to track if an alarm has been triggered
+MODEL_JSON_PATH = os.getenv("ACCIDENT_MODEL_JSON", "model.json")
+MODEL_WEIGHTS_PATH = os.getenv("ACCIDENT_MODEL_WEIGHTS", "model_weights.keras")
+PROBABILITY_THRESHOLD = float(os.getenv("ACCIDENT_PROB_THRESHOLD", "0.95"))
+DISPLAY_TILE_HEIGHT = int(os.getenv("ACCIDENT_TILE_HEIGHT", "360"))
+DISPLAY_TILE_WIDTH = int(os.getenv("ACCIDENT_TILE_WIDTH", "520"))
 
-model = AccidentDetectionModel("model.json", "model_weights.keras")
-font = cv2.FONT_HERSHEY_SIMPLEX
-
-# Twilio Secrets
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "+17652343207")
+EMERGENCY_PHONE_NUMBER = os.getenv("EMERGENCY_PHONE_NUMBER", "+916005971380")
 
-def save_accident_photo(frame):
+VIDEO_SOURCES = [
+    ("camera1.mp4", "Camera 1"),
+    ("camera2.mp4", "Camera 2"),
+    ("camera3.mp4", "Camera 3"),
+    ("camera4.mp4", "Camera 4"),
+]
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+def save_accident_photo(frame, camera_name):
+    """Store the frame that triggered the alarm for later review."""
     try:
         current_date_time = time.strftime("%Y-%m-%d-%H%M%S")
         directory = "accident_photos"
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-        filename = f"{directory}/{current_date_time}.jpg"
+        os.makedirs(directory, exist_ok=True)
+        safe_name = "".join(c if c.isalnum() else "_" for c in camera_name)
+        filename = os.path.join(directory, f"{safe_name}_{current_date_time}.jpg")
         cv2.imwrite(filename, frame)
-        print(f"Accident photo saved as {filename}")
-    except Exception as e:
-        print(f"Error saving accident photo: {e}")
+        print(f"[{camera_name}] Accident photo saved at {filename}")
+    except Exception as exc:
+        print(f"[{camera_name}] Error saving accident photo: {exc}")
 
-def call_ambulance():
+
+def call_emergency_services(camera_name):
+    """Trigger a Twilio voice call that announces which camera saw the crash."""
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, EMERGENCY_PHONE_NUMBER]):
+        print(f"[{camera_name}] Twilio credentials missing, skipping call.")
+        return
+
     try:
-        account_sid = TWILIO_ACCOUNT_SID
-        auth_token = TWILIO_AUTH_TOKEN
-        client = Client(account_sid, auth_token)
-        
-        call = client.calls.create(
-            url="https://handler.twilio.com/twiml/EH7dd72f68b969250a748d2c9e8b503a1c",  # Sample TwiML URL
-            to="+91 9348701981",  # add verified ambulance number 
-            from_="+1 765 234 3207"
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        message = (
+            f"Accident detected on {camera_name}. "
+            "Please dispatch emergency services immediately."
         )
-        print(call.sid)
-    except Exception as e:
-        print(f"Error calling ambulance: {e}")
+        client.calls.create(
+            twiml=f"<Response><Say voice='alice'>{message}</Say></Response>",
+            to=EMERGENCY_PHONE_NUMBER,
+            from_=TWILIO_FROM_NUMBER,
+        )
+        print(f"[{camera_name}] Emergency services notified through Twilio.")
+    except Exception as exc:
+        print(f"[{camera_name}] Error while contacting emergency services: {exc}")
 
-def show_alert_message():
-    def on_call_ambulance():
-        call_ambulance()
-        alert_window.destroy()
 
-    # Play the beep sound
-    frequency = 2500  
-    duration = 2000  
-    winsound.Beep(frequency, duration)
+def _load_video_captures(video_sources):
+    captures = []
+    for source, name in video_sources:
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            print(f"[{name}] Unable to open video source: {source}")
+            captures.append(None)
+            continue
+        captures.append(cap)
+    return captures
 
-    alert_window = tk.Tk()
-    alert_window.title("Alert")
-    alert_window.geometry("500x250")  # Adjust window size to fit the GIF and message box
-    alert_label = tk.Label(alert_window, text="Alert: Accident Detected!\n\nIs the Accident Critical?", fg="black", font=("Helvetica", 16))
-    alert_label.pack()
 
-    # Load and display the GIF
-    gif_path =   "" # Replace with the actual path to your GIF
-    gif = Image.open(gif_path)
-    resized_gif = gif.resize((150, 100), Image.BICUBIC)  # Use Image.BICUBIC for resizing
+def _build_grid(frames, tile_size=None):
+    """Combine frames into a single grid image."""
+    tile_size = tile_size or (DISPLAY_TILE_HEIGHT, DISPLAY_TILE_WIDTH)
+    if not frames:
+        return None
 
+    cols = math.ceil(math.sqrt(len(frames)))
+    rows = math.ceil(len(frames) / cols)
+
+    tile_h, tile_w = tile_size
+    grid_image = np.zeros((rows * tile_h, cols * tile_w, 3), dtype=np.uint8)
+
+    for idx, frame in enumerate(frames):
+        if frame is None:
+            continue
+        resized = cv2.resize(frame, (tile_w, tile_h))
+        row = idx // cols
+        col = idx % cols
+        grid_image[row * tile_h : (row + 1) * tile_h, col * tile_w : (col + 1) * tile_w] = resized
+
+    return grid_image
+
+
+def _predict_accident(model, frame):
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    roi = cv2.resize(rgb_frame, (250, 250))
+    pred, prob = model.predict_accident(roi[np.newaxis, :, :])
     try:
-        global gif_image  # Create a global variable to hold the reference to the image object
-        gif_image = ImageTk.PhotoImage(resized_gif)
-        gif_label = tk.Label(alert_window, image=gif_image)
-        gif_label.pack()
-    except Exception as e:
-        print(f"Error loading GIF: {e}")
+        probability = float(prob[0][0])
+    except Exception:
+        probability = float(prob) if prob is not None else 0.0
+    return pred, probability
 
-    call_ambulance_button = tk.Button(alert_window, text="Call Ambulance", command=on_call_ambulance)
-    call_ambulance_button.pack()
 
-    cancel_button = tk.Button(alert_window, text="Cancel", command=alert_window.destroy)
-    cancel_button.pack()
+def startapplication(video_sources=None):
+    """Launch the multi-camera simulation window."""
+    sources = video_sources or VIDEO_SOURCES
+    model = AccidentDetectionModel(MODEL_JSON_PATH, MODEL_WEIGHTS_PATH)
+    captures = _load_video_captures(sources)
+    alarm_state = {name: False for _, name in sources}
 
-    alert_window.mainloop()
-    
-def start_alert_thread():
-    alert_thread = threading.Thread(target=show_alert_message)
-    alert_thread.daemon = True  # Set the thread as daemon so it doesn't block the main thread
-    alert_thread.start()
+    if not any(cap for cap in captures):
+        print("No valid video sources available. Exiting simulation.")
+        return
 
-def startapplication():
-    global alarm_triggered  # Use global variable for tracking alarm status
-    video = cv2.VideoCapture("test_video.mp4") 
+    window_name = "Accident Monitoring Wall"
+
     while True:
-        ret, frame = video.read()
-        if not ret:
-            print("No more frames to read")
+        frames_for_grid = []
+
+        for idx, (source, camera_name) in enumerate(sources):
+            cap = captures[idx]
+            if cap is None:
+                blank = np.zeros((DISPLAY_TILE_HEIGHT, DISPLAY_TILE_WIDTH, 3), dtype=np.uint8)
+                frames_for_grid.append(blank)
+                continue
+
+            ret, frame = cap.read()
+            if not ret:
+                # Loop demo clips indefinitely
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret:
+                    blank = np.zeros((DISPLAY_TILE_HEIGHT, DISPLAY_TILE_WIDTH, 3), dtype=np.uint8)
+                    frames_for_grid.append(blank)
+                    continue
+
+            pred, probability = _predict_accident(model, frame)
+            probability_percent = probability * 100
+            label = f"{camera_name}: {pred} {probability_percent:.1f}%"
+            color = (0, 0, 255) if pred == "Accident" and probability >= PROBABILITY_THRESHOLD else (0, 200, 0)
+
+            cv2.rectangle(frame, (0, 0), (frame.shape[1], 40), (0, 0, 0), -1)
+            cv2.putText(frame, label, (10, 30), FONT, 0.8, color, 2, cv2.LINE_AA)
+
+            alarm_ready = probability >= PROBABILITY_THRESHOLD and pred == "Accident"
+            if alarm_ready and not alarm_state[camera_name]:
+                alarm_state[camera_name] = True
+                save_accident_photo(frame, camera_name)
+                threading.Thread(
+                    target=call_emergency_services, args=(camera_name,), daemon=True
+                ).start()
+            elif not alarm_ready:
+                alarm_state[camera_name] = False
+
+            display_frame = cv2.resize(frame, (DISPLAY_TILE_WIDTH, DISPLAY_TILE_HEIGHT))
+            frames_for_grid.append(display_frame)
+
+        grid = _build_grid(frames_for_grid, (DISPLAY_TILE_HEIGHT, DISPLAY_TILE_WIDTH))
+        if grid is None:
             break
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        roi = cv2.resize(gray_frame, (250, 250))
 
-        pred, prob = model.predict_accident(roi[np.newaxis, :, :])
-        if pred == "Accident" and not alarm_triggered:
-            prob = round(prob[0][0] * 100, 2)
-            
-            if prob > 90:
-                # frequency = 2500  
-                # duration = 2000  
-                # winsound.Beep(frequency, duration)
-                save_accident_photo(frame)
-                alarm_triggered = True  # Set the alarm_triggered flag to True
-                call_ambulance()  # Start the alert message thread
+        cv2.imshow(window_name, grid)
+        # Press q to close the monitoring wall
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
-            cv2.rectangle(frame, (0, 0), (280, 40), (0, 0, 0), -1)
-            cv2.putText(frame, pred + " " + str(prob), (20, 30), font, 1, (255, 255, 0), 2)
+    for cap in captures:
+        if cap is not None:
+            cap.release()
+    cv2.destroyAllWindows()
 
-        if cv2.waitKey(33) & 0xFF == ord('q'):
-            return
-        cv2.imshow('Video', frame)  
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     startapplication()
-
